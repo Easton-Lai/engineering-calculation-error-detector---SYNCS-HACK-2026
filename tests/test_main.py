@@ -1,3 +1,4 @@
+import math
 import runpy
 import sys
 import unittest
@@ -14,11 +15,15 @@ from Main import (
     MAX_AST_NODES,
     MAX_EXPRESSION_LENGTH,
     MAX_INTEGER_BITS,
+    UNIT_CATEGORIES,
     build_calculation_variables,
     build_dimension_variables,
     check_calculation,
     check_dimensions,
+    check_unit_conversion,
     compatible_quantity_name,
+    convert_quantity,
+    display_unit_label,
     eval_expr,
     format_dimensions,
     make_quantity,
@@ -482,6 +487,127 @@ class DimensionCheckerTests(unittest.TestCase):
             check_dimensions("F = missing", self.default_variables())
 
 
+class UnitConverterTests(unittest.TestCase):
+    def test_default_length_conversion(self) -> None:
+        source, converted = convert_quantity(1.0, "mm", "cm")
+
+        self.assertEqual(source.magnitude, 1.0)
+        self.assertAlmostEqual(converted.magnitude, 0.1)
+
+        _, density = convert_quantity(1.0, "kg·m⁻³", "g/L")
+        self.assertAlmostEqual(density.magnitude, 1.0)
+
+    def test_converts_offset_temperatures(self) -> None:
+        _, converted = convert_quantity(0.0, "degC", "degF")
+
+        self.assertAlmostEqual(converted.magnitude, 32.0)
+
+    def test_formats_engineering_unit_labels(self) -> None:
+        cases = {
+            "delta_degC": "Δ°C",
+            "delta_degF": "Δ°F",
+            "mm**2": "mm²",
+            "kg*m**4": "kg·m⁴",
+            "N*m": "N·m",
+            "milliohm": "mΩ",
+            "kiloohm": "kΩ",
+        }
+
+        for unit_text, expected in cases.items():
+            with self.subTest(unit_text=unit_text):
+                self.assertEqual(display_unit_label(unit_text), expected)
+
+    def test_all_catalog_units_parse_and_are_compatible_within_category(
+        self,
+    ) -> None:
+        self.assertEqual(len(UNIT_CATEGORIES), 33)
+        self.assertEqual(
+            sum(len(units) for units in UNIT_CATEGORIES.values()),
+            177,
+        )
+
+        for category, units in UNIT_CATEGORIES.items():
+            reference_unit = units[0]
+
+            for unit in units:
+                with self.subTest(category=category, unit=unit):
+                    _, converted = convert_quantity(
+                        1.0,
+                        unit,
+                        reference_unit,
+                    )
+                    self.assertTrue(
+                        math.isfinite(float(converted.magnitude))
+                    )
+
+    def test_rejects_blank_and_unknown_units(self) -> None:
+        cases = [
+            ("", "m", "A source unit is required."),
+            ("m", "", "A target unit is required."),
+            (
+                "not_a_real_unit",
+                "m",
+                "Invalid unit for source unit",
+            ),
+            (
+                "m",
+                "not_a_real_unit",
+                "Invalid unit for target unit",
+            ),
+        ]
+
+        for source_unit, target_unit, message in cases:
+            with self.subTest(
+                source_unit=source_unit,
+                target_unit=target_unit,
+            ):
+                with self.assertRaisesRegex(ValueError, message):
+                    convert_quantity(1.0, source_unit, target_unit)
+
+    def test_rejects_dimensionally_incompatible_units(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            r"Incompatible units: m .* while s ",
+        ):
+            convert_quantity(1.0, "m", "s")
+
+    def test_rejects_non_real_or_non_finite_values(self) -> None:
+        invalid_values = [
+            True,
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            complex(1, 2),
+        ]
+
+        for value in invalid_values:
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    convert_quantity(
+                        cast(Any, value),
+                        "m",
+                        "cm",
+                    )
+
+    def test_conversion_output_is_stable(self) -> None:
+        self.assertEqual(
+            check_unit_conversion(1.0, "mm", "cm"),
+            (
+                "✓ CONVERSION COMPLETE\n\n"
+                "Input\n"
+                "1.0 mm\n\n"
+                "Converted result\n"
+                "0.1 cm\n\n"
+                "SI / base-unit form\n"
+                "0.001 m\n\n"
+                "Dimensions\n"
+                "L\n\n"
+                "Compatible quantity dimension:\n"
+                "Length"
+            ),
+        )
+
+
 class ApplicationEntrypointTests(unittest.TestCase):
     def test_plain_python_run_launches_streamlit_and_propagates_exit_code(
         self,
@@ -531,17 +657,25 @@ class StreamlitAppTests(unittest.TestCase):
     def make_app() -> AppTest:
         return AppTest.from_file(APP_PATH, default_timeout=10).run()
 
-    def test_renders_both_checker_tabs(self) -> None:
+    def test_renders_all_tool_tabs(self) -> None:
         app = self.make_app()
 
         self.assertEqual(len(app.exception), 0)
         self.assertEqual(
             [tab.label for tab in app.tabs],
-            ["Calculation Checker", "Dimensional Checker"],
+            [
+                "Calculation Checker",
+                "Dimensional Checker",
+                "Unit Converter",
+            ],
         )
         self.assertEqual(
             {button.key for button in app.button},
-            {"check_calculation_button", "check_dimensions_button"},
+            {
+                "check_calculation_button",
+                "check_dimensions_button",
+                "convert_units_button",
+            },
         )
 
     def test_default_calculation_is_consistent(self) -> None:
@@ -618,6 +752,44 @@ class StreamlitAppTests(unittest.TestCase):
         self.assertEqual(len(app.exception), 0)
         self.assertIn("ERROR", app.code[0].value)
         self.assertIn("=", app.code[0].value)
+
+    def test_default_common_unit_conversion(self) -> None:
+        app = self.make_app()
+
+        self.assertEqual(
+            app.radio("converter_entry_mode").value,
+            "Common engineering units",
+        )
+        self.assertEqual(app.selectbox("converter_category").value, "Length")
+        self.assertEqual(app.selectbox("converter_source_common").value, "mm")
+        self.assertEqual(app.selectbox("converter_target_common").value, "cm")
+
+        app.button("convert_units_button").click().run()
+
+        self.assertEqual(len(app.exception), 0)
+        self.assertIn("CONVERSION COMPLETE", app.code[0].value)
+        self.assertIn("1.0 mm", app.code[0].value)
+        self.assertIn("0.1 cm", app.code[0].value)
+
+    def test_custom_unit_conversion(self) -> None:
+        app = self.make_app()
+        app.radio("converter_entry_mode").set_value("Custom units").run()
+
+        self.assertEqual(
+            app.text_input("converter_source_custom").value,
+            "kPa",
+        )
+        self.assertEqual(
+            app.text_input("converter_target_custom").value,
+            "psi",
+        )
+
+        app.button("convert_units_button").click().run()
+
+        self.assertEqual(len(app.exception), 0)
+        self.assertIn("CONVERSION COMPLETE", app.code[0].value)
+        self.assertIn("1.0 kPa", app.code[0].value)
+        self.assertIn("psi", app.code[0].value)
 
 
 if __name__ == "__main__":

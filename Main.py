@@ -8,7 +8,7 @@ import operator as op
 import re
 import subprocess
 import sys
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
@@ -528,7 +528,7 @@ UNIT_CATEGORIES: Final[dict[str, tuple[str, ...]]] = {
     "Resistance": (
         "milliohm",
         "ohm",
-        "kilohm",
+        "kiloohm",
         "megaohm",
     ),
 
@@ -540,30 +540,54 @@ UNIT_CATEGORIES: Final[dict[str, tuple[str, ...]]] = {
 }
 
 
-def _as_binary_operation(
-    operation: object,
-) -> BinaryOperation:
+_UNIT_LABEL_REPLACEMENTS: Final[tuple[tuple[str, str], ...]] = (
+    ("US_liquid_gallon", "US gal"),
+    ("imperial_gallon", "Imp gal"),
+    ("metric_horsepower", "metric hp"),
+    ("nautical_mile", "nmi"),
+    ("delta_degC", "Δ°C"),
+    ("delta_degF", "Δ°F"),
+    ("milliliter", "mL"),
+    ("liter", "L"),
+    ("revolution", "rev"),
+    ("radian", "rad"),
+    ("degree", "deg"),
+    ("arcminute", "arcmin"),
+    ("arcsecond", "arcsec"),
+    ("minute", "min"),
+    ("hour", "h"),
+    ("foot", "ft"),
+    ("inch", "in"),
+    ("pound", "lb"),
+    ("milliohm", "mΩ"),
+    ("kiloohm", "kΩ"),
+    ("megaohm", "MΩ"),
+    ("ohm", "Ω"),
+    ("**4", "⁴"),
+    ("**3", "³"),
+    ("**2", "²"),
+    ("*", "·"),
+    ("_", " "),
+)
+
+
+def _as_binary_operation(operation: object) -> BinaryOperation:
     return cast(BinaryOperation, operation)
 
 
-def _as_unary_operation(
-    operation: object,
-) -> UnaryOperation:
+def _as_unary_operation(operation: object) -> UnaryOperation:
     return cast(UnaryOperation, operation)
 
 
-ALLOWED_BINARY_OPERATORS: Final[
-    dict[type[ast.operator], BinaryOperation]
-] = {
+ALLOWED_BINARY_OPERATORS: Final[dict[type[ast.operator], BinaryOperation]] = {
     ast.Add: _as_binary_operation(op.add),
     ast.Sub: _as_binary_operation(op.sub),
     ast.Mult: _as_binary_operation(op.mul),
     ast.Div: _as_binary_operation(op.truediv),
+    ast.Pow: _as_binary_operation(op.pow),
 }
 
-ALLOWED_UNARY_OPERATORS: Final[
-    dict[type[ast.unaryop], UnaryOperation]
-] = {
+ALLOWED_UNARY_OPERATORS: Final[dict[type[ast.unaryop], UnaryOperation]] = {
     ast.UAdd: _as_unary_operation(op.pos),
     ast.USub: _as_unary_operation(op.neg),
 }
@@ -573,21 +597,14 @@ def make_quantity(
     magnitude: Scalar,
     unit: str | Unit | None = None,
 ) -> CalculationQuantity:
-    return _QUANTITY_FACTORY(
-        _require_real_scalar(magnitude),
-        unit,
-    )
+    return _QUANTITY_FACTORY(_require_real_scalar(magnitude), unit)
 
 
-def parse_unit(
-    unit_text: str,
-) -> Unit:
+def parse_unit(unit_text: str) -> Unit:
     return ureg.parse_units(unit_text)
 
 
-def _replace_superscript(
-    match: re.Match[str],
-) -> str:
+def _replace_superscript(match: re.Match[str]) -> str:
     exponent = match.group().translate(
         _SUPERSCRIPT_TRANSLATION
     )
@@ -606,9 +623,7 @@ def _replace_superscript(
     return f"**{exponent}"
 
 
-def normalize_text(
-    text: str | None,
-) -> str:
+def normalize_text(text: str | None) -> str:
     if text is None:
         return ""
 
@@ -623,9 +638,7 @@ def normalize_text(
     return normalized
 
 
-def _canonical_fraction(
-    value: object,
-) -> Fraction:
+def _canonical_fraction(value: object) -> Fraction:
     if isinstance(value, bool):
         raise UserInputError(
             "An exponent must be a finite real number."
@@ -672,9 +685,11 @@ def _canonical_fraction(
     return exponent
 
 
-def _normalized_power(
-    value: CalculationValue,
-) -> Scalar:
+def _fraction_as_scalar(value: Fraction) -> Scalar:
+    return value.numerator if value.denominator == 1 else float(value)
+
+
+def _normalized_power(value: CalculationValue) -> Scalar:
     if isinstance(value, Quantity):
         if value.dimensionality:
             raise UserInputError(
@@ -690,16 +705,10 @@ def _normalized_power(
 
     exponent = _canonical_fraction(scalar)
 
-    return (
-        exponent.numerator
-        if exponent.denominator == 1
-        else float(exponent)
-    )
+    return _fraction_as_scalar(exponent)
 
 
-def _require_real_scalar(
-    value: object,
-) -> Scalar:
+def _require_real_scalar(value: object) -> Scalar:
     if isinstance(value, bool):
         raise UserInputError(
             "Boolean values are not allowed."
@@ -725,9 +734,7 @@ def _require_real_scalar(
     )
 
 
-def _require_calculation_value(
-    value: object,
-) -> CalculationValue:
+def _require_calculation_value(value: object) -> CalculationValue:
     if isinstance(value, Quantity):
         _require_real_scalar(value.magnitude)
         return value
@@ -735,9 +742,7 @@ def _require_calculation_value(
     return _require_real_scalar(value)
 
 
-def _parse_expression(
-    expression: str,
-) -> ast.expr:
+def _parse_expression(expression: str) -> ast.expr:
     normalized = normalize_text(expression)
 
     if not normalized:
@@ -884,7 +889,7 @@ def _eval_ast(
                 )
 
             return _apply_binary_operation(
-                _as_binary_operation(op.pow),
+                ALLOWED_BINARY_OPERATORS[ast.Pow],
                 left,
                 exponent,
             )
@@ -927,9 +932,7 @@ def _eval_ast(
     )
 
 
-def _dimension_map(
-    value: CalculationQuantity | Unit,
-) -> DimensionMap:
+def _dimension_map(value: CalculationQuantity | Unit) -> DimensionMap:
     return {
         str(key): _canonical_fraction(exponent)
         for key, exponent
@@ -969,15 +972,13 @@ def _scale_dimensions(
     exponent: Fraction,
 ) -> DimensionMap:
     return {
-        key: value * exponent
+        key: scaled_value
         for key, value in dimensions.items()
-        if value * exponent
+        if (scaled_value := value * exponent)
     }
 
 
-def _format_exponent(
-    exponent: Fraction,
-) -> str:
+def _format_exponent(exponent: Fraction) -> str:
     if exponent.denominator == 1:
         return str(exponent.numerator)
 
@@ -1031,9 +1032,7 @@ def format_dimensionality(
     )
 
 
-def format_dimensions(
-    quantity: CalculationQuantity,
-) -> str:
+def format_dimensions(quantity: CalculationQuantity) -> str:
     return format_dimensionality(
         _dimension_map(quantity)
     )
@@ -1048,9 +1047,7 @@ def _compatible_dimension_name(
     )
 
 
-def compatible_quantity_name(
-    quantity: CalculationQuantity,
-) -> str:
+def compatible_quantity_name(quantity: CalculationQuantity) -> str:
     return _compatible_dimension_name(
         _dimension_map(quantity)
     )
@@ -1169,27 +1166,44 @@ def _eval_dimension_ast(
             variable_map,
         )
 
-        if isinstance(
-            node.op,
-            (
-                ast.Add,
-                ast.Sub,
-            ),
-        ):
-            if (
-                left.dimensions
-                != right.dimensions
-            ):
+        if isinstance(node.op, ast.Pow):
+            if right.dimensions or right.scalar is None:
+                raise UserInputError(
+                    "A dimensional exponent must be "
+                    "a known dimensionless number."
+                )
+
+            exponent = _canonical_fraction(
+                right.scalar
+            )
+
+            return DimensionValue(
+                _scale_dimensions(
+                    left.dimensions,
+                    exponent,
+                ),
+                _known_binary_scalar_result(
+                    ALLOWED_BINARY_OPERATORS[ast.Pow],
+                    left.scalar,
+                    _fraction_as_scalar(exponent),
+                ),
+            )
+
+        operation = ALLOWED_BINARY_OPERATORS.get(
+            type(node.op)
+        )
+
+        if operation is None:
+            raise UserInputError(
+                "This operator is not allowed."
+            )
+
+        if isinstance(node.op, (ast.Add, ast.Sub)):
+            if left.dimensions != right.dimensions:
                 raise UserInputError(
                     "Addition and subtraction "
                     "require matching dimensions."
                 )
-
-            operation = (
-                _as_binary_operation(op.add)
-                if isinstance(node.op, ast.Add)
-                else _as_binary_operation(op.sub)
-            )
 
             return DimensionValue(
                 left.dimensions,
@@ -1200,65 +1214,23 @@ def _eval_dimension_ast(
                 ),
             )
 
-        if isinstance(node.op, ast.Mult):
+        if isinstance(node.op, (ast.Mult, ast.Div)):
+            right_factor = (
+                1
+                if isinstance(node.op, ast.Mult)
+                else -1
+            )
+
             return DimensionValue(
                 _combine_dimensions(
                     left.dimensions,
                     right.dimensions,
-                    1,
+                    right_factor,
                 ),
                 _known_binary_scalar_result(
-                    _as_binary_operation(op.mul),
+                    operation,
                     left.scalar,
                     right.scalar,
-                ),
-            )
-
-        if isinstance(node.op, ast.Div):
-            return DimensionValue(
-                _combine_dimensions(
-                    left.dimensions,
-                    right.dimensions,
-                    -1,
-                ),
-                _known_binary_scalar_result(
-                    _as_binary_operation(
-                        op.truediv
-                    ),
-                    left.scalar,
-                    right.scalar,
-                ),
-            )
-
-        if isinstance(node.op, ast.Pow):
-            if (
-                right.dimensions
-                or right.scalar is None
-            ):
-                raise UserInputError(
-                    "A dimensional exponent must be "
-                    "a known dimensionless number."
-                )
-
-            exponent = _canonical_fraction(
-                right.scalar
-            )
-
-            scalar_exponent: Scalar = (
-                exponent.numerator
-                if exponent.denominator == 1
-                else float(exponent)
-            )
-
-            return DimensionValue(
-                _scale_dimensions(
-                    left.dimensions,
-                    exponent,
-                ),
-                _known_binary_scalar_result(
-                    _as_binary_operation(op.pow),
-                    left.scalar,
-                    scalar_exponent,
                 ),
             )
 
@@ -1271,37 +1243,32 @@ def _eval_dimension_ast(
     )
 
 
-def _is_missing(
-    value: Any,
-) -> bool:
+def _is_blank(value: Any) -> bool:
     try:
-        return bool(pd.isna(value))
+        if bool(pd.isna(value)):
+            return True
 
     except (
         TypeError,
         ValueError,
     ):
-        return False
+        pass
+
+    return not str(value).strip()
 
 
-def _is_blank(
-    value: Any,
-) -> bool:
-    return (
-        _is_missing(value)
-        or not str(value).strip()
-    )
-
-
-def _validate_variable_name(
-    name: str,
+def _validated_variable_name(
+    raw_name: Any,
     row_number: int,
-) -> None:
-    if not name:
+    existing_names: Collection[str],
+) -> str:
+    if _is_blank(raw_name):
         raise UserInputError(
             f"Variable name is required "
             f"in row {row_number}."
         )
+
+    name = str(raw_name).strip()
 
     if (
         not name.isidentifier()
@@ -1311,6 +1278,13 @@ def _validate_variable_name(
             f"Invalid variable name "
             f"in row {row_number}: {name}"
         )
+
+    if name in existing_names:
+        raise UserInputError(
+            f"Duplicate variable name: {name}"
+        )
+
+    return name
 
 
 def _numeric_table_value(
@@ -1428,23 +1402,11 @@ def build_calculation_variables(
         ):
             continue
 
-        if name_is_blank:
-            raise UserInputError(
-                f"Variable name is required "
-                f"in row {row_number}."
-            )
-
-        name = str(raw_name).strip()
-
-        _validate_variable_name(
-            name,
+        name = _validated_variable_name(
+            raw_name,
             row_number,
+            variable_map,
         )
-
-        if name in variable_map:
-            raise UserInputError(
-                f"Duplicate variable name: {name}"
-            )
 
         if value_is_blank:
             raise UserInputError(
@@ -1477,9 +1439,7 @@ def build_calculation_variables(
     return variable_map
 
 
-def build_dimension_variables(
-    dataframe: pd.DataFrame,
-) -> dict[str, DimensionValue]:
+def build_dimension_variables(dataframe: pd.DataFrame) -> dict[str, DimensionValue]:
     variable_map: dict[
         str,
         DimensionValue,
@@ -1508,23 +1468,11 @@ def build_dimension_variables(
         ):
             continue
 
-        if name_is_blank:
-            raise UserInputError(
-                f"Variable name is required "
-                f"in row {row_number}."
-            )
-
-        name = str(raw_name).strip()
-
-        _validate_variable_name(
-            name,
+        name = _validated_variable_name(
+            raw_name,
             row_number,
+            variable_map,
         )
-
-        if name in variable_map:
-            raise UserInputError(
-                f"Duplicate variable name: {name}"
-            )
 
         if unit_is_blank:
             raise UserInputError(
@@ -1548,9 +1496,7 @@ def build_dimension_variables(
     return variable_map
 
 
-def _as_quantity(
-    value: CalculationValue,
-) -> CalculationQuantity:
+def _as_quantity(value: CalculationValue) -> CalculationQuantity:
     return (
         value
         if isinstance(value, Quantity)
@@ -1569,13 +1515,13 @@ def _format_calculation_success(
 
     return (
         f"{heading}\n\n"
-        f"Result\n"
+        "Result\n"
         f"{format(displayed_result, '~P')}\n\n"
-        f"SI form\n"
+        "SI form\n"
         f"{format(si_result, '~P')}\n\n"
-        f"Dimensions\n"
+        "Dimensions\n"
         f"{dimensions}\n\n"
-        f"Compatible quantity dimension:\n"
+        "Compatible quantity dimension:\n"
         f"{quantity_type}"
     )
 
@@ -1635,11 +1581,11 @@ def check_calculation(
     ):
         return (
             "✗ DIMENSIONAL MISMATCH\n\n"
-            f"Expression produces\n"
+            "Expression produces\n"
             f"{actual_dimensions}\n\n"
-            f"Expected\n"
+            "Expected\n"
             f"{format_dimensionality(expected_dimension_map)}\n\n"
-            f"Expression quantity type\n"
+            "Expression quantity type\n"
             f"{quantity_type}"
         )
 
@@ -1662,9 +1608,7 @@ def check_calculation(
     )
 
 
-def _split_equation(
-    equation: str,
-) -> tuple[str, str]:
+def _split_equation(equation: str) -> tuple[str, str]:
     if not equation.strip():
         raise UserInputError(
             "Equation cannot be empty."
@@ -1769,23 +1713,19 @@ def check_dimensions(
         "✗ DIMENSIONAL MISMATCH\n\n"
         f"{left_summary}\n\n"
         f"{right_summary}\n\n"
-        f"Right / left dimensional ratio\n"
+        "Right / left dimensional ratio\n"
         f"{ratio}\n\n"
         "A valid physical equation requires "
         "this ratio to be dimensionless."
     )
 
 
-def _show_result(
-    output: str,
-) -> None:
+def _show_result(output: str) -> None:
     st.write("Result:")
     st.code(output)
 
 
-def _show_unexpected_error(
-    error: Exception,
-) -> None:
+def _show_unexpected_error(error: Exception) -> None:
     LOGGER.exception(
         "Unexpected UnitGuard error",
         exc_info=error,
@@ -1795,6 +1735,23 @@ def _show_unexpected_error(
         "ERROR\n\n"
         "An unexpected internal error occurred."
     )
+
+
+def _run_ui_action(
+    action: Callable[[], str],
+) -> bool:
+    try:
+        output = action()
+
+    except UserInputError as error:
+        output = f"ERROR\n\n{error}"
+
+    except Exception as error:
+        _show_unexpected_error(error)
+        return False
+
+    _show_result(output)
+    return True
 
 
 def render_calculation_checker() -> None:
@@ -1869,25 +1826,16 @@ def render_calculation_checker() -> None:
         "CHECK CALCULATION",
         key="check_calculation_button",
     ):
-        try:
-            output = check_calculation(
+        if not _run_ui_action(
+            lambda: check_calculation(
                 expression,
                 build_calculation_variables(
                     calculation_table
                 ),
                 expected_unit,
             )
-
-        except UserInputError as error:
-            output = (
-                f"ERROR\n\n{error}"
-            )
-
-        except Exception as error:
-            _show_unexpected_error(error)
+        ):
             return
-
-        _show_result(output)
 
 
 def render_dimensional_checker() -> None:
@@ -1952,24 +1900,15 @@ def render_dimensional_checker() -> None:
         "CHECK DIMENSIONS",
         key="check_dimensions_button",
     ):
-        try:
-            output = check_dimensions(
+        if not _run_ui_action(
+            lambda: check_dimensions(
                 equation,
                 build_dimension_variables(
                     dimension_table
                 ),
             )
-
-        except UserInputError as error:
-            output = (
-                f"ERROR\n\n{error}"
-            )
-
-        except Exception as error:
-            _show_unexpected_error(error)
+        ):
             return
-
-        _show_result(output)
 
     st.caption(
         "Dimensional consistency is necessary, "
@@ -1978,123 +1917,10 @@ def render_dimensional_checker() -> None:
     )
 
 
-def display_unit_label(
-    unit_text: str,
-) -> str:
+def display_unit_label(unit_text: str) -> str:
     display_text = unit_text
 
-    replacements = (
-        (
-            "US_liquid_gallon",
-            "US gal",
-        ),
-        (
-            "imperial_gallon",
-            "Imp gal",
-        ),
-        (
-            "metric_horsepower",
-            "metric hp",
-        ),
-        (
-            "nautical_mile",
-            "nmi",
-        ),
-        (
-            "delta_degC",
-            "Δ°C",
-        ),
-        (
-            "delta_degF",
-            "Δ°F",
-        ),
-        (
-            "milliliter",
-            "mL",
-        ),
-        (
-            "liter",
-            "L",
-        ),
-        (
-            "revolution",
-            "rev",
-        ),
-        (
-            "radian",
-            "rad",
-        ),
-        (
-            "degree",
-            "deg",
-        ),
-        (
-            "arcminute",
-            "arcmin",
-        ),
-        (
-            "arcsecond",
-            "arcsec",
-        ),
-        (
-            "minute",
-            "min",
-        ),
-        (
-            "hour",
-            "h",
-        ),
-        (
-            "foot",
-            "ft",
-        ),
-        (
-            "inch",
-            "in",
-        ),
-        (
-            "pound",
-            "lb",
-        ),
-        (
-            "milliohm",
-            "mΩ",
-        ),
-        (
-            "kilohm",
-            "kΩ",
-        ),
-        (
-            "megaohm",
-            "MΩ",
-        ),
-        (
-            "ohm",
-            "Ω",
-        ),
-        (
-            "**4",
-            "⁴",
-        ),
-        (
-            "**3",
-            "³",
-        ),
-        (
-            "**2",
-            "²",
-        ),
-        (
-            "*",
-            "·",
-        ),
-        (
-            "_",
-            " ",
-        ),
-    )
-
-    for old, new in replacements:
+    for old, new in _UNIT_LABEL_REPLACEMENTS:
         display_text = display_text.replace(
             old,
             new,
@@ -2199,15 +2025,15 @@ def check_unit_conversion(
 
     return (
         "✓ CONVERSION COMPLETE\n\n"
-        f"Input\n"
+        "Input\n"
         f"{format(source_quantity, '~P')}\n\n"
-        f"Converted result\n"
+        "Converted result\n"
         f"{format(converted_quantity, '~P')}\n\n"
-        f"SI / base-unit form\n"
+        "SI / base-unit form\n"
         f"{format(base_quantity, '~P')}\n\n"
-        f"Dimensions\n"
+        "Dimensions\n"
         f"{format_dimensionality(dimensions)}\n\n"
-        f"Compatible quantity dimension:\n"
+        "Compatible quantity dimension:\n"
         f"{_compatible_dimension_name(dimensions)}"
     )
 
@@ -2327,23 +2153,14 @@ def render_unit_converter() -> None:
         "CONVERT",
         key="convert_units_button",
     ):
-        try:
-            output = check_unit_conversion(
+        if not _run_ui_action(
+            lambda: check_unit_conversion(
                 value,
                 source_unit,
                 target_unit,
             )
-
-        except UserInputError as error:
-            output = (
-                f"ERROR\n\n{error}"
-            )
-
-        except Exception as error:
-            _show_unexpected_error(error)
+        ):
             return
-
-        _show_result(output)
 
     st.caption(
         "Common-unit mode keeps both units "
