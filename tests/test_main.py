@@ -16,6 +16,7 @@ from Main import (
     MAX_EXPRESSION_LENGTH,
     MAX_INTEGER_BITS,
     UNIT_CATEGORIES,
+    UserInputError,
     build_calculation_variables,
     build_dimension_variables,
     check_calculation,
@@ -60,7 +61,7 @@ class ExpressionEvaluatorTests(unittest.TestCase):
         result = eval_expr("F / A", variable_map)
 
         self.assertIsInstance(result, Quantity)
-        self.assertAlmostEqual(result.to("MPa").magnitude, 50)
+        self.assertAlmostEqual(cast(Any, result).to("MPa").magnitude, 50)
 
     def test_numeric_binary_power_and_unary_operations(self) -> None:
         self.assertEqual(eval_expr("2 + 3 * 4", {}), 14)
@@ -179,7 +180,24 @@ class ExpressionEvaluatorTests(unittest.TestCase):
 
         self.assertIsInstance(direct, Quantity)
         self.assertIsInstance(computed, Quantity)
-        self.assertEqual(direct.dimensionality, computed.dimensionality)
+        self.assertEqual(
+            cast(Any, direct).dimensionality,
+            cast(Any, computed).dimensionality,
+        )
+
+    def test_scaled_dimensionless_exponent_uses_base_magnitude(self) -> None:
+        result = eval_expr(
+            "x**p",
+            {
+                "x": make_quantity(4, "m"),
+                "p": make_quantity(50, "percent"),
+            },
+        )
+
+        self.assertIsInstance(result, Quantity)
+        quantity_result = cast(Any, result)
+        self.assertAlmostEqual(quantity_result.to("m**0.5").magnitude, 2.0)
+        self.assertEqual(format_dimensions(quantity_result), "L^0.5")
 
 
 class QuantityTests(unittest.TestCase):
@@ -232,7 +250,10 @@ class CalculationVariableBuilderTests(unittest.TestCase):
         temperature = build_calculation_variables(table)["T"]
 
         self.assertIsInstance(temperature, Quantity)
-        self.assertAlmostEqual(temperature.to("degF").magnitude, 77)
+        self.assertAlmostEqual(
+            cast(Any, temperature).to("degF").magnitude,
+            77,
+        )
 
     def test_rejects_value_without_variable_name(self) -> None:
         table = pd.DataFrame(
@@ -284,6 +305,18 @@ class CalculationVariableBuilderTests(unittest.TestCase):
                 )
                 with self.assertRaises(ValueError):
                     build_calculation_variables(table)
+
+    def test_rejects_integer_too_large_for_table_float(self) -> None:
+        table = pd.DataFrame(
+            [{"Variable": "x", "Value": 10**400, "Unit": "m"}],
+            dtype=object,
+        )
+
+        with self.assertRaisesRegex(
+            UserInputError,
+            r"^Invalid numeric value for variable x in row 1\.$",
+        ):
+            build_calculation_variables(table)
 
 
 class DimensionVariableBuilderTests(unittest.TestCase):
@@ -356,7 +389,7 @@ class CalculationCheckerTests(unittest.TestCase):
         output = check_calculation("F / A", variable_map, "MPa")
 
         self.assertIn("DIMENSIONALLY CONSISTENT", output)
-        self.assertRegex(output, r"50(?:\.0+)? MPa")
+        self.assertIn("Result\n50 MPa", output)
 
     def test_dimension_mismatch_is_reported(self) -> None:
         output = check_calculation(
@@ -399,6 +432,24 @@ class CalculationCheckerTests(unittest.TestCase):
             ):
                 with self.assertRaises(ValueError):
                     check_calculation(expression, variable_map, expected_unit)
+
+    def test_rejects_non_finite_converted_and_si_results(self) -> None:
+        cases = [
+            (make_quantity(1e308, "m"), "mm"),
+            (make_quantity(1e308, "parsec"), ""),
+        ]
+
+        for value, expected_unit in cases:
+            with self.subTest(expected_unit=expected_unit):
+                with self.assertRaisesRegex(
+                    UserInputError,
+                    r"^The calculation produced a non-finite value\.$",
+                ):
+                    check_calculation(
+                        "x",
+                        {"x": value},
+                        expected_unit,
+                    )
 
 
 class DimensionCheckerTests(unittest.TestCase):
@@ -486,6 +537,13 @@ class DimensionCheckerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unknown variable"):
             check_dimensions("F = missing", self.default_variables())
 
+    def test_none_equation_is_reported_as_empty(self) -> None:
+        with self.assertRaisesRegex(
+            UserInputError,
+            r"^Equation cannot be empty\.$",
+        ):
+            check_dimensions(cast(Any, None), {})
+
 
 class UnitConverterTests(unittest.TestCase):
     def test_default_length_conversion(self) -> None:
@@ -501,6 +559,10 @@ class UnitConverterTests(unittest.TestCase):
         _, converted = convert_quantity(0.0, "degC", "degF")
 
         self.assertAlmostEqual(converted.magnitude, 32.0)
+        self.assertIn(
+            "Converted result\n32 °F",
+            check_unit_conversion(0.0, "degC", "degF"),
+        )
 
     def test_formats_engineering_unit_labels(self) -> None:
         cases = {
@@ -589,13 +651,27 @@ class UnitConverterTests(unittest.TestCase):
                         "cm",
                     )
 
+    def test_rejects_non_finite_converted_and_base_results(self) -> None:
+        actions = [
+            lambda: convert_quantity(1e308, "m", "mm"),
+            lambda: check_unit_conversion(1e308, "parsec", "parsec"),
+        ]
+
+        for action in actions:
+            with self.subTest(action=action):
+                with self.assertRaisesRegex(
+                    UserInputError,
+                    r"^The conversion produced a non-finite value\.$",
+                ):
+                    action()
+
     def test_conversion_output_is_stable(self) -> None:
         self.assertEqual(
             check_unit_conversion(1.0, "mm", "cm"),
             (
                 "✓ CONVERSION COMPLETE\n\n"
                 "Input\n"
-                "1.0 mm\n\n"
+                "1 mm\n\n"
                 "Converted result\n"
                 "0.1 cm\n\n"
                 "SI / base-unit form\n"
@@ -684,7 +760,7 @@ class StreamlitAppTests(unittest.TestCase):
 
         self.assertEqual(len(app.exception), 0)
         self.assertIn("DIMENSIONALLY CONSISTENT", app.code[0].value)
-        self.assertRegex(app.code[0].value, r"50(?:\.0+)? MPa")
+        self.assertIn("Result\n50 MPa", app.code[0].value)
 
     def test_default_dimensional_equation_is_consistent(self) -> None:
         app = self.make_app()
@@ -768,7 +844,7 @@ class StreamlitAppTests(unittest.TestCase):
 
         self.assertEqual(len(app.exception), 0)
         self.assertIn("CONVERSION COMPLETE", app.code[0].value)
-        self.assertIn("1.0 mm", app.code[0].value)
+        self.assertIn("1 mm", app.code[0].value)
         self.assertIn("0.1 cm", app.code[0].value)
 
     def test_custom_unit_conversion(self) -> None:
@@ -788,8 +864,48 @@ class StreamlitAppTests(unittest.TestCase):
 
         self.assertEqual(len(app.exception), 0)
         self.assertIn("CONVERSION COMPLETE", app.code[0].value)
-        self.assertIn("1.0 kPa", app.code[0].value)
-        self.assertIn("psi", app.code[0].value)
+        self.assertIn("Input\n1 kPa", app.code[0].value)
+        self.assertIn(
+            "Converted result\n0.14503773773 psi",
+            app.code[0].value,
+        )
+
+    def test_conversion_overflow_is_reported_as_user_error(self) -> None:
+        app = self.make_app()
+        app.number_input("converter_value").set_value(1e308).run()
+        app.selectbox("converter_source_common").set_value("m").run()
+        app.selectbox("converter_target_common").set_value("mm").run()
+        app.button("convert_units_button").click().run()
+
+        self.assertEqual(len(app.exception), 0)
+        self.assertEqual(
+            app.code[0].value,
+            "ERROR\n\nThe conversion produced a non-finite value.",
+        )
+
+    def test_repeated_reruns_keep_unit_tools_functional(self) -> None:
+        app = self.make_app()
+
+        for expression in ("F/A", "F / A", "F/A"):
+            app.text_input("calculation_expression").set_value(expression).run()
+            self.assertEqual(len(app.exception), 0)
+
+        app.button("check_calculation_button").click().run()
+        self.assertEqual(len(app.exception), 0)
+        self.assertIn("Result\n50 MPa", app.code[0].value)
+
+        app.button("check_dimensions_button").click().run()
+        self.assertEqual(len(app.exception), 0)
+        self.assertIn("DIMENSIONALLY CONSISTENT", app.code[0].value)
+        self.assertIn("Force", app.code[0].value)
+
+        app.radio("converter_entry_mode").set_value("Custom units").run()
+        app.button("convert_units_button").click().run()
+        self.assertEqual(len(app.exception), 0)
+        self.assertIn(
+            "Converted result\n0.14503773773 psi",
+            app.code[0].value,
+        )
 
 
 if __name__ == "__main__":

@@ -12,10 +12,11 @@ from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
-from typing import Any, Final, NoReturn, TypeAlias, cast
+from typing import Any, Final, NoReturn, TypeAlias, TypeVar, cast
 
 import pandas as pd
 from pint.errors import PintError
+from pint.facets.plain import PlainQuantity
 from pint.registry import Quantity, Unit, UnitRegistry
 import streamlit as st
 from streamlit import runtime as st_runtime
@@ -31,6 +32,10 @@ UnaryOperation: TypeAlias = Callable[[CalculationValue], object]
 QuantityFactory: TypeAlias = Callable[
     [Scalar, str | Unit | None], CalculationQuantity
 ]
+_FiniteQuantityT = TypeVar(
+    "_FiniteQuantityT",
+    bound=PlainQuantity[Any],
+)
 
 MAX_EXPRESSION_LENGTH: Final = 1_000
 MAX_AST_NODES: Final = 200
@@ -39,10 +44,27 @@ MAX_INTEGER_BITS: Final = 4_096
 MAX_EXPONENT_DENOMINATOR: Final = 1_000_000
 EXPONENT_REL_TOLERANCE: Final = 1e-12
 EXPONENT_ABS_TOLERANCE: Final = 1e-15
+_CALCULATION_NON_FINITE_MESSAGE: Final = (
+    "The calculation produced a non-finite value."
+)
+_CONVERSION_NON_FINITE_MESSAGE: Final = (
+    "The conversion produced a non-finite value."
+)
 
 LOGGER: Final = logging.getLogger(__name__)
 
-ureg: UnitRegistry[Any] = UnitRegistry("")
+
+@st.cache_resource(show_spinner=False, scope="session")
+def _cached_unit_registry() -> UnitRegistry[Any]:
+    return UnitRegistry("")
+
+
+ureg: UnitRegistry[Any]
+
+if st_runtime.exists():
+    ureg = _cached_unit_registry()
+else:
+    ureg = UnitRegistry("")
 
 # Pint creates the registry-bound Quantity class dynamically.
 _QUANTITY_FACTORY = cast(
@@ -50,9 +72,7 @@ _QUANTITY_FACTORY = cast(
     cast(object, ureg.Quantity),
 )
 
-_SUPERSCRIPT_PATTERN: Final = re.compile(
-    r"[⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻]+"
-)
+_SUPERSCRIPT_PATTERN: Final = re.compile(r"[⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻]+")
 
 _SUPERSCRIPT_TRANSLATION: Final = str.maketrans(
     {
@@ -696,9 +716,11 @@ def _normalized_power(value: CalculationValue) -> Scalar:
                 "An exponent must be dimensionless."
             )
 
-        scalar = _require_real_scalar(
-            value.magnitude
+        base_value = _require_finite_quantity(
+            value.to_base_units(),
+            _CALCULATION_NON_FINITE_MESSAGE,
         )
+        scalar = _require_real_scalar(base_value.magnitude)
 
     else:
         scalar = _require_real_scalar(value)
@@ -734,6 +756,19 @@ def _require_real_scalar(value: object) -> Scalar:
     )
 
 
+def _require_finite_quantity(
+    value: _FiniteQuantityT,
+    error_message: str,
+) -> _FiniteQuantityT:
+    try:
+        _require_real_scalar(value.magnitude)
+
+    except UserInputError:
+        raise UserInputError(error_message) from None
+
+    return value
+
+
 def _require_calculation_value(value: object) -> CalculationValue:
     if isinstance(value, Quantity):
         _require_real_scalar(value.magnitude)
@@ -767,10 +802,7 @@ def _parse_expression(expression: str) -> ast.expr:
             "Invalid expression syntax."
         ) from None
 
-    node_count = sum(
-        1
-        for _ in ast.walk(tree)
-    )
+    node_count = sum(1 for _ in ast.walk(tree))
 
     if node_count > MAX_AST_NODES:
         raise UserInputError(
@@ -935,8 +967,7 @@ def _eval_ast(
 def _dimension_map(value: CalculationQuantity | Unit) -> DimensionMap:
     return {
         str(key): _canonical_fraction(exponent)
-        for key, exponent
-        in value.dimensionality.items()
+        for key, exponent in value.dimensionality.items()
         if exponent
     }
 
@@ -1303,6 +1334,7 @@ def _numeric_table_value(
         value = float(raw_value)
 
     except (
+        OverflowError,
         TypeError,
         ValueError,
     ):
@@ -1497,11 +1529,11 @@ def build_dimension_variables(dataframe: pd.DataFrame) -> dict[str, DimensionVal
 
 
 def _as_quantity(value: CalculationValue) -> CalculationQuantity:
-    return (
-        value
-        if isinstance(value, Quantity)
-        else make_quantity(value)
-    )
+    return value if isinstance(value, Quantity) else make_quantity(value)
+
+
+def _format_quantity(value: PlainQuantity[Any]) -> str:
+    return format(value, "~.12gP")
 
 
 def _format_calculation_success(
@@ -1511,14 +1543,17 @@ def _format_calculation_success(
     dimensions: str,
     quantity_type: str,
 ) -> str:
-    si_result = original_result.to_base_units()
+    si_result = _require_finite_quantity(
+        original_result.to_base_units(),
+        _CALCULATION_NON_FINITE_MESSAGE,
+    )
 
     return (
         f"{heading}\n\n"
         "Result\n"
-        f"{format(displayed_result, '~P')}\n\n"
+        f"{_format_quantity(displayed_result)}\n\n"
         "SI form\n"
-        f"{format(si_result, '~P')}\n\n"
+        f"{_format_quantity(si_result)}\n\n"
         "Dimensions\n"
         f"{dimensions}\n\n"
         "Compatible quantity dimension:\n"
@@ -1590,8 +1625,9 @@ def check_calculation(
         )
 
     try:
-        converted_result = result.to(
-            expected_unit_object
+        converted_result = _require_finite_quantity(
+            result.to(expected_unit_object),
+            _CALCULATION_NON_FINITE_MESSAGE,
         )
 
     except PintError as error:
@@ -1609,7 +1645,7 @@ def check_calculation(
 
 
 def _split_equation(equation: str) -> tuple[str, str]:
-    if not equation.strip():
+    if not equation or not equation.strip():
         raise UserInputError(
             "Equation cannot be empty."
         )
@@ -1620,12 +1656,9 @@ def _split_equation(equation: str) -> tuple[str, str]:
             "exactly one '=' sign."
         )
 
-    left_expression, right_expression = (
-        expression.strip()
-        for expression in equation.split(
-            "=",
-            maxsplit=1,
-        )
+    left_expression, right_expression = map(
+        str.strip,
+        equation.split("=", maxsplit=1),
     )
 
     if not left_expression:
@@ -1652,10 +1685,8 @@ def _format_dimension_side(
     return (
         f"{label}\n"
         f"{expression}\n"
-        f"Dimensions: "
-        f"{format_dimensionality(result.dimensions)}\n"
-        f"Quantity type: "
-        f"{_compatible_dimension_name(result.dimensions)}"
+        f"Dimensions: {format_dimensionality(result.dimensions)}\n"
+        f"Quantity type: {_compatible_dimension_name(result.dimensions)}"
     )
 
 
@@ -1804,18 +1835,9 @@ def render_calculation_checker() -> None:
             width="stretch",
             key="calculation_variable_table",
             column_config={
-                "Variable":
-                    st.column_config.TextColumn(
-                        "Variable"
-                    ),
-                "Value":
-                    st.column_config.NumberColumn(
-                        "Value"
-                    ),
-                "Unit":
-                    st.column_config.TextColumn(
-                        "Unit"
-                    ),
+                "Variable": st.column_config.TextColumn("Variable"),
+                "Value": st.column_config.NumberColumn("Value"),
+                "Unit": st.column_config.TextColumn("Unit"),
             },
         ),
     )
@@ -1891,14 +1913,8 @@ def render_dimensional_checker() -> None:
             width="stretch",
             key="dimension_variable_table",
             column_config={
-                "Variable":
-                    st.column_config.TextColumn(
-                        "Variable"
-                    ),
-                "Unit":
-                    st.column_config.TextColumn(
-                        "Unit"
-                    ),
+                "Variable": st.column_config.TextColumn("Variable"),
+                "Unit": st.column_config.TextColumn("Unit"),
             },
         ),
     )
@@ -1944,13 +1960,8 @@ def convert_quantity(
     CalculationQuantity,
     CalculationQuantity,
 ]:
-    source_unit_text = normalize_text(
-        from_unit
-    )
-
-    target_unit_text = normalize_text(
-        to_unit
-    )
+    source_unit_text = normalize_text(from_unit)
+    target_unit_text = normalize_text(to_unit)
 
     if not source_unit_text:
         raise UserInputError(
@@ -1973,13 +1984,8 @@ def convert_quantity(
         context="target unit",
     )
 
-    source_dimensions = _dimension_map(
-        source_quantity
-    )
-
-    target_dimensions = _dimension_map(
-        target_unit
-    )
+    source_dimensions = _dimension_map(source_quantity)
+    target_dimensions = _dimension_map(target_unit)
 
     if (
         source_dimensions
@@ -1994,8 +2000,9 @@ def convert_quantity(
         )
 
     try:
-        converted_quantity = (
-            source_quantity.to(target_unit)
+        converted_quantity = _require_finite_quantity(
+            source_quantity.to(target_unit),
+            _CONVERSION_NON_FINITE_MESSAGE,
         )
 
     except PintError as error:
@@ -2022,22 +2029,21 @@ def check_unit_conversion(
         )
     )
 
-    dimensions = _dimension_map(
-        source_quantity
-    )
+    dimensions = _dimension_map(source_quantity)
 
-    base_quantity = (
-        source_quantity.to_base_units()
+    base_quantity = _require_finite_quantity(
+        source_quantity.to_base_units(),
+        _CONVERSION_NON_FINITE_MESSAGE,
     )
 
     return (
         "✓ CONVERSION COMPLETE\n\n"
         "Input\n"
-        f"{format(source_quantity, '~P')}\n\n"
+        f"{_format_quantity(source_quantity)}\n\n"
         "Converted result\n"
-        f"{format(converted_quantity, '~P')}\n\n"
+        f"{_format_quantity(converted_quantity)}\n\n"
         "SI / base-unit form\n"
-        f"{format(base_quantity, '~P')}\n\n"
+        f"{_format_quantity(base_quantity)}\n\n"
         "Dimensions\n"
         f"{format_dimensionality(dimensions)}\n\n"
         "Compatible quantity dimension:\n"
@@ -2077,10 +2083,7 @@ def render_unit_converter() -> None:
         ),
     )
 
-    if (
-        entry_mode
-        == "Common engineering units"
-    ):
+    if entry_mode == "Common engineering units":
         category = cast(
             str,
             st.selectbox(
@@ -2090,13 +2093,8 @@ def render_unit_converter() -> None:
             ),
         )
 
-        unit_options = (
-            UNIT_CATEGORIES[category]
-        )
-
-        left_column, right_column = (
-            st.columns(2)
-        )
+        unit_options = UNIT_CATEGORIES[category]
+        left_column, right_column = st.columns(2)
 
         with left_column:
             source_unit = cast(
