@@ -5,51 +5,29 @@ import keyword
 import operator as op
 import subprocess
 import sys
-from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any, NoReturn, TypeAlias, cast
 
 import pandas as pd
-from pint.registry import Quantity, Unit, UnitRegistry
 import streamlit as st
+from pint import UnitRegistry
 from streamlit import runtime as st_runtime
 
 
-ureg: UnitRegistry[float] = UnitRegistry("")
-
-Scalar: TypeAlias = int | float
-CalculationQuantity: TypeAlias = Quantity[Any]
-CalculationValue: TypeAlias = Scalar | CalculationQuantity
-BinaryOperation: TypeAlias = Callable[[CalculationValue, CalculationValue], object]
-UnaryOperation: TypeAlias = Callable[[CalculationValue], object]
-QuantityFactory: TypeAlias = Callable[
-    [Scalar, str | Unit | None], CalculationQuantity
-]
+# =========================================================
+# Unit registry
+# =========================================================
+ureg = UnitRegistry()
 
 
-def make_quantity(
-    magnitude: Scalar,
-    unit: str | Unit | None = None,
-) -> CalculationQuantity:
-    """Create a quantity bound to this module's unit registry."""
-    quantity_factory = cast(QuantityFactory, cast(object, ureg.Quantity))
-    return quantity_factory(magnitude, unit)
-
-
-def parse_unit(unit_text: str) -> Unit:
-    """Parse a unit with this module's unit registry."""
-    return ureg.parse_units(unit_text)
-
-
-# -----------------------------
-# Helpers
-# -----------------------------
+# =========================================================
+# Text normalisation
+# =========================================================
 def normalize_text(text: str | None) -> str:
-    """Normalize user input for expressions and units."""
     if text is None:
         return ""
 
-    normalized = text.strip()
+    normalized = str(text).strip()
+
     replacements = {
         "²": "**2",
         "³": "**3",
@@ -60,281 +38,604 @@ def normalize_text(text: str | None) -> str:
         "÷": "/",
         "−": "-",
     }
+
     for old, new in replacements.items():
         normalized = normalized.replace(old, new)
+
     return normalized
 
 
-def format_exponent(value: Any) -> str:
+# =========================================================
+# Dimension formatting
+# =========================================================
+DIMENSION_SYMBOLS = {
+    "[mass]": "M",
+    "[length]": "L",
+    "[time]": "T",
+    "[current]": "I",
+    "[temperature]": "Θ",
+    "[substance]": "N",
+    "[luminosity]": "J",
+}
+
+DIMENSION_ORDER = [
+    "[mass]",
+    "[length]",
+    "[time]",
+    "[current]",
+    "[temperature]",
+    "[substance]",
+    "[luminosity]",
+]
+
+
+def format_exponent(value) -> str:
+    """Format a dimensional exponent cleanly."""
     try:
         integer_value = int(value)
-    except (TypeError, ValueError, OverflowError):
-        return str(value)
 
-    if integer_value == value:
-        return str(integer_value)
+        if integer_value == value:
+            return str(integer_value)
+
+    except (TypeError, ValueError, OverflowError):
+        pass
+
     return str(value)
 
 
-def format_dimensions(quantity: CalculationQuantity) -> str:
-    dims = quantity.dimensionality
-    if not dims:
+def format_dimensionality(dimensionality) -> str:
+    if not dimensionality:
         return "dimensionless"
 
-    symbol_map = {
-        "[mass]": "M",
-        "[length]": "L",
-        "[time]": "T",
-        "[current]": "I",
-        "[temperature]": "Θ",
-        "[substance]": "N",
-        "[luminosity]": "J",
+    dimensionality_dict = dict(dimensionality)
+
+    ordered_keys = DIMENSION_ORDER.copy()
+
+    for key in dimensionality_dict:
+        if key not in ordered_keys:
+            ordered_keys.append(key)
+
+    parts: list[str] = []
+
+    for key in ordered_keys:
+        exponent = dimensionality_dict.get(key, 0)
+
+        if exponent == 0:
+            continue
+
+        symbol = DIMENSION_SYMBOLS.get(key, str(key))
+
+        if exponent == 1:
+            parts.append(symbol)
+        else:
+            parts.append(f"{symbol}^{format_exponent(exponent)}")
+
+    return " ".join(parts) if parts else "dimensionless"
+
+
+def format_dimensions(quantity) -> str:
+    """Return the dimension notation of a Pint quantity."""
+    return format_dimensionality(quantity.dimensionality)
+
+
+def compatible_quantity_name(quantity) -> str:
+    dimensions = frozenset(quantity.dimensionality.items())
+
+    known_dimensions = {
+        frozenset(
+            {
+                "[mass]": 1,
+                "[length]": -1,
+                "[time]": -2,
+            }.items()
+        ): "Pressure / Stress",
+
+        frozenset(
+            {
+                "[mass]": 1,
+                "[length]": 2,
+                "[time]": -2,
+            }.items()
+        ): "Energy / Torque",
+
+        frozenset(
+            {
+                "[length]": 1,
+                "[time]": -1,
+            }.items()
+        ): "Velocity",
+
+        frozenset(
+            {
+                "[length]": 1,
+                "[time]": -2,
+            }.items()
+        ): "Acceleration",
+
+        frozenset(
+            {
+                "[mass]": 1,
+                "[length]": 1,
+                "[time]": -1,
+            }.items()
+        ): "Momentum",
+
+        frozenset(
+            {
+                "[mass]": 1,
+                "[length]": 2,
+                "[time]": -3,
+            }.items()
+        ): "Power",
+
+        frozenset(
+            {
+                "[mass]": 1,
+                "[length]": 1,
+                "[time]": -2,
+            }.items()
+        ): "Force",
+
+        frozenset(
+            {
+                "[length]": 2,
+            }.items()
+        ): "Area",
+
+        frozenset(
+            {
+                "[length]": 3,
+            }.items()
+        ): "Volume",
+
+        frozenset(
+            {
+                "[length]": 3,
+                "[time]": -1,
+            }.items()
+        ): "Volumetric Flow Rate",
+
+        frozenset(
+            {
+                "[mass]": 1,
+                "[length]": -3,
+            }.items()
+        ): "Density",
+
+        frozenset(): "Dimensionless",
     }
-    order = [
-        "[mass]",
-        "[length]",
-        "[time]",
-        "[current]",
-        "[temperature]",
-        "[substance]",
-        "[luminosity]",
-    ]
 
-    parts = []
-    for key in order:
-        if key in dims:
-            exponent = dims[key]
-            symbol = symbol_map.get(key, key)
-            if exponent == 1:
-                parts.append(symbol)
-            else:
-                parts.append(f"{symbol}^{format_exponent(exponent)}")
-    return " ".join(parts)
+    return known_dimensions.get(dimensions, "Unknown / Not mapped")
 
 
-def compatible_quantity_name(quantity: CalculationQuantity) -> str:
-    dims = quantity.dimensionality
-    known = {
-        frozenset({"[mass]": 1, "[length]": -1, "[time]": -2}.items()): "Pressure / Stress",
-        frozenset({"[mass]": 1, "[length]": 2, "[time]": -2}.items()): "Energy / Torque",
-        frozenset({"[length]": 1, "[time]": -1}.items()): "Velocity",
-        frozenset({"[length]": 1, "[time]": -2}.items()): "Acceleration",
-        frozenset({"[mass]": 1, "[length]": 1, "[time]": -1}.items()): "Momentum",
-        frozenset({"[mass]": 1, "[length]": 2, "[time]": -3}.items()): "Power",
-        frozenset({"[mass]": 1, "[length]": 1, "[time]": -2}.items()): "Force",
-        frozenset({"[length]": 3, "[time]": -1}.items()): "Volumetric Flow Rate",
-    }
-    return known.get(frozenset(dims.items()), "Unknown / Not mapped")
+def dimensional_ratio(left_quantity, right_quantity) -> str:
+
+    left_dims = dict(left_quantity.dimensionality)
+    right_dims = dict(right_quantity.dimensionality)
+
+    all_keys = set(left_dims) | set(right_dims)
+
+    difference = {}
+
+    for key in all_keys:
+        exponent = right_dims.get(key, 0) - left_dims.get(key, 0)
+
+        if exponent != 0:
+            difference[key] = exponent
+
+    return format_dimensionality(difference)
 
 
-# -----------------------------
+# =========================================================
 # Safe expression evaluator
-# -----------------------------
-def _as_binary_operation(operation: object) -> BinaryOperation:
-    return cast(BinaryOperation, operation)
-
-
-def _as_unary_operation(operation: object) -> UnaryOperation:
-    return cast(UnaryOperation, operation)
-
-
-ALLOWED_BIN_OPS: dict[type[ast.operator], BinaryOperation] = {
-    ast.Add: _as_binary_operation(op.add),
-    ast.Sub: _as_binary_operation(op.sub),
-    ast.Mult: _as_binary_operation(op.mul),
-    ast.Div: _as_binary_operation(op.truediv),
-    ast.Pow: _as_binary_operation(op.pow),
+# =========================================================
+ALLOWED_BINARY_OPERATORS = {
+    ast.Add: op.add,
+    ast.Sub: op.sub,
+    ast.Mult: op.mul,
+    ast.Div: op.truediv,
+    ast.Pow: op.pow,
 }
 
-ALLOWED_UNARY_OPS: dict[type[ast.unaryop], UnaryOperation] = {
-    ast.UAdd: _as_unary_operation(op.pos),
-    ast.USub: _as_unary_operation(op.neg),
+ALLOWED_UNARY_OPERATORS = {
+    ast.UAdd: op.pos,
+    ast.USub: op.neg,
 }
 
 
-def _require_calculation_value(value: object) -> CalculationValue:
+def is_valid_calculation_value(value) -> bool:
+
     if isinstance(value, bool):
-        raise ValueError("Expressions may only contain real numbers and quantities.")
+        return False
 
     if isinstance(value, (int, float)):
-        return value
+        return True
 
-    if isinstance(value, Quantity):
-        magnitude = value.magnitude
-        if isinstance(magnitude, bool) or not isinstance(magnitude, (int, float)):
-            raise ValueError("Expressions may only contain real numbers and quantities.")
-        return value
+    if hasattr(value, "dimensionality"):
+        return True
 
-    raise ValueError("Expressions may only contain real numbers and quantities.")
+    return False
 
 
-def eval_expr(
-    expr: str,
-    variable_map: Mapping[str, CalculationValue],
-) -> CalculationValue:
-    normalized_expr = normalize_text(expr)
-    tree = ast.parse(normalized_expr, mode="eval")
-    return _eval_ast(tree.body, variable_map)
+def eval_expr(expression: str, variable_map: dict):
+    normalized_expression = normalize_text(expression)
+
+    try:
+        syntax_tree = ast.parse(normalized_expression, mode="eval")
+    except SyntaxError:
+        raise ValueError("Invalid expression syntax.") from None
+
+    return evaluate_ast_node(syntax_tree.body, variable_map)
 
 
-def _eval_ast(
-    node: ast.expr,
-    variable_map: Mapping[str, CalculationValue],
-) -> CalculationValue:
+def evaluate_ast_node(node, variable_map: dict):
     if isinstance(node, ast.Constant):
-        return _require_calculation_value(node.value)
+        if not isinstance(node.value, (int, float)):
+            raise ValueError(
+                "Expressions may only contain numbers and variables."
+            )
+
+        if isinstance(node.value, bool):
+            raise ValueError("Boolean values are not allowed.")
+
+        return node.value
 
     if isinstance(node, ast.Name):
         if node.id not in variable_map:
             raise ValueError(f"Unknown variable: {node.id}")
+
         return variable_map[node.id]
 
     if isinstance(node, ast.BinOp):
-        operation = ALLOWED_BIN_OPS.get(type(node.op))
-        if operation is None:
-            raise ValueError("Operator not allowed.")
-        left = _eval_ast(node.left, variable_map)
-        right = _eval_ast(node.right, variable_map)
-        return _require_calculation_value(operation(left, right))
+        operator_function = ALLOWED_BINARY_OPERATORS.get(type(node.op))
+
+        if operator_function is None:
+            raise ValueError("This operator is not allowed.")
+
+        left_value = evaluate_ast_node(node.left, variable_map)
+        right_value = evaluate_ast_node(node.right, variable_map)
+
+        result = operator_function(left_value, right_value)
+
+        if not is_valid_calculation_value(result):
+            raise ValueError("The expression produced an invalid result.")
+
+        return result
 
     if isinstance(node, ast.UnaryOp):
-        operation = ALLOWED_UNARY_OPS.get(type(node.op))
-        if operation is None:
-            raise ValueError("Unary operator not allowed.")
-        operand = _eval_ast(node.operand, variable_map)
-        return _require_calculation_value(operation(operand))
+        operator_function = ALLOWED_UNARY_OPERATORS.get(type(node.op))
 
-    raise ValueError("Invalid expression.")
+        if operator_function is None:
+            raise ValueError("This unary operator is not allowed.")
+
+        operand = evaluate_ast_node(node.operand, variable_map)
+        result = operator_function(operand)
+
+        if not is_valid_calculation_value(result):
+            raise ValueError("The expression produced an invalid result.")
+
+        return result
+
+    raise ValueError("Invalid or unsupported expression.")
 
 
-def _is_missing(value: Any) -> bool:
-    """Return whether a scalar table cell contains a missing value."""
-    return bool(pd.isna(value))
+
+def is_missing(value) -> bool:
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
 
 
-def build_variables(df: pd.DataFrame) -> dict[str, CalculationValue]:
-    variable_map: dict[str, CalculationValue] = {}
+def validate_variable_name(name: str, row_number: int) -> None:
 
-    for row_number, (_, row) in enumerate(df.iterrows(), start=1):
-        raw_value = row["Value"]
-        if _is_missing(raw_value) or raw_value == "":
+    if not name:
+        raise ValueError(
+            f"Variable name is required in row {row_number}."
+        )
+
+    if not name.isidentifier():
+        raise ValueError(
+            f"Invalid variable name in row {row_number}: {name}"
+        )
+
+    if keyword.iskeyword(name):
+        raise ValueError(
+            f"Python keyword cannot be used as a variable: {name}"
+        )
+
+
+# =========================================================
+# Calculation Checker variable builder
+# =========================================================
+def build_calculation_variables(
+    dataframe: pd.DataFrame,
+) -> dict:
+
+    variable_map = {}
+
+    for row_number, (_, row) in enumerate(
+        dataframe.iterrows(),
+        start=1,
+    ):
+        raw_name = row.get("Variable", "")
+        raw_value = row.get("Value", "")
+        raw_unit = row.get("Unit", "")
+
+        empty_name = is_missing(raw_name) or not str(raw_name).strip()
+        empty_value = is_missing(raw_value) or raw_value == ""
+        empty_unit = is_missing(raw_unit) or not str(raw_unit).strip()
+
+        # Ignore completely empty rows
+        if empty_name and empty_value and empty_unit:
             continue
 
-        raw_name = row["Variable"]
-        if _is_missing(raw_name) or not str(raw_name).strip():
-            raise ValueError(f"Variable name is required in row {row_number}.")
+        if empty_name:
+            raise ValueError(
+                f"Variable name is required in row {row_number}."
+            )
 
         name = str(raw_name).strip()
-        if not name.isidentifier() or keyword.iskeyword(name):
-            raise ValueError(f"Invalid variable name: {name}")
+        validate_variable_name(name, row_number)
+
         if name in variable_map:
             raise ValueError(f"Duplicate variable name: {name}")
 
-        try:
-            value = float(raw_value)
-        except (TypeError, ValueError):
-            raise ValueError(f"Invalid numeric value for variable: {name}") from None
+        if empty_value:
+            raise ValueError(
+                f"Value is required for variable: {name}"
+            )
 
-        raw_unit = row["Unit"]
-        unit = "" if _is_missing(raw_unit) else normalize_text(str(raw_unit))
-        variable_map[name] = make_quantity(value, unit) if unit else value
+        try:
+            numeric_value = float(raw_value)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"Invalid numeric value for variable: {name}"
+            ) from None
+
+        unit_text = (
+            ""
+            if empty_unit
+            else normalize_text(str(raw_unit))
+        )
+
+        if unit_text:
+            try:
+                variable_map[name] = ureg.Quantity(
+                    numeric_value,
+                    unit_text,
+                )
+            except Exception:
+                raise ValueError(
+                    f"Invalid unit for variable {name}: {unit_text}"
+                ) from None
+        else:
+            variable_map[name] = numeric_value
+
+    if not variable_map:
+        raise ValueError("At least one variable is required.")
 
     return variable_map
 
 
-# -----------------------------
-# UI
-# -----------------------------
-def main() -> None:
-    st.set_page_config(page_title="UnitGuard", layout="wide")
-    st.title("UnitGuard")
+# =========================================================
+# Dimensional Checker variable builder
+# =========================================================
+def build_dimension_variables(
+    dataframe: pd.DataFrame,
+) -> dict:
 
-    st.subheader("Expression")
+    variable_map = {}
+
+    for row_number, (_, row) in enumerate(
+        dataframe.iterrows(),
+        start=1,
+    ):
+        raw_name = row.get("Variable", "")
+        raw_unit = row.get("Unit", "")
+
+        empty_name = is_missing(raw_name) or not str(raw_name).strip()
+        empty_unit = is_missing(raw_unit) or not str(raw_unit).strip()
+
+        # Ignore completely empty rows
+        if empty_name and empty_unit:
+            continue
+
+        if empty_name:
+            raise ValueError(
+                f"Variable name is required in row {row_number}."
+            )
+
+        name = str(raw_name).strip()
+        validate_variable_name(name, row_number)
+
+        if name in variable_map:
+            raise ValueError(f"Duplicate variable name: {name}")
+
+        if empty_unit:
+            raise ValueError(
+                f"Unit is required for variable: {name}"
+            )
+
+        unit_text = normalize_text(str(raw_unit))
+
+        try:
+            variable_map[name] = ureg.Quantity(1, unit_text)
+        except Exception:
+            raise ValueError(
+                f"Invalid unit for variable {name}: {unit_text}"
+            ) from None
+
+    if not variable_map:
+        raise ValueError("At least one variable is required.")
+
+    return variable_map
+
+
+def ensure_quantity(value):
+    """
+    Convert a plain numerical result into a dimensionless Pint quantity.
+    """
+    if hasattr(value, "dimensionality"):
+        return value
+
+    return ureg.Quantity(value)
+
+
+# =========================================================
+# Calculation Checker UI
+# =========================================================
+def render_calculation_checker() -> None:
+    st.subheader("Calculation Checker")
+
+    st.write(
+        "Enter an engineering expression, numerical values and units."
+    )
+
     expression = (
         st.text_input(
-            "Expression input",
+            "Expression",
             value="F / A",
-            label_visibility="collapsed",
+            key="calculation_expression",
         )
         or ""
     )
 
-    st.write("Then a table:")
-    default_df = pd.DataFrame(
+    default_calculation_table = pd.DataFrame(
         [
-            {"Variable": "F", "Value": 10.0, "Unit": "kN"},
-            {"Variable": "A", "Value": 200.0, "Unit": "mm^2"},
+            {
+                "Variable": "F",
+                "Value": 10.0,
+                "Unit": "kN",
+            },
+            {
+                "Variable": "A",
+                "Value": 200.0,
+                "Unit": "mm^2",
+            },
         ]
     )
 
-    edited_df = cast(
-        pd.DataFrame,
-        st.data_editor(
-            default_df,
-            num_rows="dynamic",
-            hide_index=True,
-            width="stretch",
-            column_config={
-                "Variable": st.column_config.TextColumn("Variable"),
-                "Value": st.column_config.NumberColumn("Value"),
-                "Unit": st.column_config.TextColumn("Unit"),
-            },
-        ),
+    calculation_table = st.data_editor(
+        default_calculation_table,
+        num_rows="dynamic",
+        hide_index=True,
+        use_container_width=True,
+        key="calculation_variable_table",
+        column_config={
+            "Variable": st.column_config.TextColumn(
+                "Variable"
+            ),
+            "Value": st.column_config.NumberColumn(
+                "Value"
+            ),
+            "Unit": st.column_config.TextColumn(
+                "Unit"
+            ),
+        },
     )
 
-    st.write("Then enter:")
-    expected_unit = st.text_input("Expected output unit:", value="MPa") or ""
+    expected_unit = (
+        st.text_input(
+            "Expected output unit",
+            value="MPa",
+            key="calculation_expected_unit",
+        )
+        or ""
+    )
 
-    if st.button("CHECK CALCULATION"):
+    if st.button(
+        "CHECK CALCULATION",
+        key="check_calculation_button",
+    ):
         try:
-            variable_map = build_variables(edited_df)
-
             if not expression.strip():
                 raise ValueError("Expression cannot be empty.")
 
-            evaluated_result = eval_expr(expression, variable_map)
-            result = (
-                evaluated_result
-                if isinstance(evaluated_result, Quantity)
-                else make_quantity(evaluated_result)
+            variable_map = build_calculation_variables(
+                calculation_table
             )
 
-            actual_dims = format_dimensions(result)
-            actual_kind = compatible_quantity_name(result)
+            evaluated_result = eval_expr(
+                expression,
+                variable_map,
+            )
+
+            result = ensure_quantity(evaluated_result)
+
+            actual_dimensions = format_dimensions(result)
+            actual_quantity_type = compatible_quantity_name(result)
+
             expected_unit_text = normalize_text(expected_unit)
 
             if expected_unit_text:
-                expected_unit_obj = parse_unit(expected_unit_text)
-                expected_q = make_quantity(1, expected_unit_obj)
-                is_consistent = result.dimensionality == expected_q.dimensionality
+                try:
+                    expected_unit_object = ureg.parse_units(
+                        expected_unit_text
+                    )
+                except Exception:
+                    raise ValueError(
+                        f"Invalid expected output unit: "
+                        f"{expected_unit_text}"
+                    ) from None
+
+                expected_quantity = ureg.Quantity(
+                    1,
+                    expected_unit_object,
+                )
+
+                is_consistent = (
+                    result.dimensionality
+                    == expected_quantity.dimensionality
+                )
 
                 if is_consistent:
-                    converted = result.to(expected_unit_obj)
-                    si_result = cast(CalculationQuantity, result.to_base_units())
+                    converted_result = result.to(
+                        expected_unit_object
+                    )
+
+                    si_result = result.to_base_units()
 
                     output = (
                         "✓ DIMENSIONALLY CONSISTENT\n\n"
-                        f"Result\n{format(converted, '~P')}\n\n"
-                        f"SI form\n{format(si_result, '~P')}\n\n"
-                        f"Dimensions\n{actual_dims}\n\n"
-                        f"Compatible quantity dimension:\n{actual_kind}"
+                        f"Result\n"
+                        f"{format(converted_result, '~P')}\n\n"
+                        f"SI form\n"
+                        f"{format(si_result, '~P')}\n\n"
+                        f"Dimensions\n"
+                        f"{actual_dimensions}\n\n"
+                        f"Compatible quantity dimension:\n"
+                        f"{actual_quantity_type}"
                     )
+
                 else:
-                    expected_dims = format_dimensions(expected_q)
+                    expected_dimensions = format_dimensions(
+                        expected_quantity
+                    )
+
                     output = (
                         "✗ DIMENSIONAL MISMATCH\n\n"
-                        f"Expression produces\n{actual_dims}\n\n"
-                        f"Expected\n{expected_dims}\n\n"
-                        f"Compatible quantity dimension:\n{actual_kind}"
+                        f"Expression produces\n"
+                        f"{actual_dimensions}\n\n"
+                        f"Expected\n"
+                        f"{expected_dimensions}\n\n"
+                        f"Expression quantity type\n"
+                        f"{actual_quantity_type}"
                     )
+
             else:
-                si_result = cast(CalculationQuantity, result.to_base_units())
+                si_result = result.to_base_units()
+
                 output = (
                     "✓ CALCULATION COMPLETE\n\n"
-                    f"Result\n{format(result, '~P')}\n\n"
-                    f"SI form\n{format(si_result, '~P')}\n\n"
-                    f"Dimensions\n{actual_dims}\n\n"
-                    f"Compatible quantity dimension:\n{actual_kind}"
+                    f"Result\n"
+                    f"{format(result, '~P')}\n\n"
+                    f"SI form\n"
+                    f"{format(si_result, '~P')}\n\n"
+                    f"Dimensions\n"
+                    f"{actual_dimensions}\n\n"
+                    f"Compatible quantity dimension:\n"
+                    f"{actual_quantity_type}"
                 )
 
             st.write("Result:")
@@ -345,8 +646,203 @@ def main() -> None:
             st.code(f"ERROR\n\n{error}")
 
 
-def _launch_streamlit() -> NoReturn:
-    """Relaunch this file through Streamlit when run as a plain Python script."""
+# =========================================================
+# Dimensional Checker UI
+# =========================================================
+def render_dimensional_checker() -> None:
+    st.subheader("Dimensional Checker")
+
+    st.write(
+        "Enter a complete equation and assign a unit to each variable. "
+        "Numerical values are not required."
+    )
+
+    equation = (
+        st.text_input(
+            "Equation",
+            value="F = m * a",
+            key="dimension_equation",
+        )
+        or ""
+    )
+
+    default_dimension_table = pd.DataFrame(
+        [
+            {
+                "Variable": "F",
+                "Unit": "N",
+            },
+            {
+                "Variable": "m",
+                "Unit": "kg",
+            },
+            {
+                "Variable": "a",
+                "Unit": "m/s^2",
+            },
+        ]
+    )
+
+    dimension_table = st.data_editor(
+        default_dimension_table,
+        num_rows="dynamic",
+        hide_index=True,
+        use_container_width=True,
+        key="dimension_variable_table",
+        column_config={
+            "Variable": st.column_config.TextColumn(
+                "Variable"
+            ),
+            "Unit": st.column_config.TextColumn(
+                "Unit"
+            ),
+        },
+    )
+
+    if st.button(
+        "CHECK DIMENSIONS",
+        key="check_dimensions_button",
+    ):
+        try:
+            if not equation.strip():
+                raise ValueError("Equation cannot be empty.")
+
+            if equation.count("=") != 1:
+                raise ValueError(
+                    "The equation must contain exactly one '=' sign."
+                )
+
+            left_expression, right_expression = equation.split(
+                "=",
+                maxsplit=1,
+            )
+
+            left_expression = left_expression.strip()
+            right_expression = right_expression.strip()
+
+            if not left_expression:
+                raise ValueError(
+                    "The left-hand side cannot be empty."
+                )
+
+            if not right_expression:
+                raise ValueError(
+                    "The right-hand side cannot be empty."
+                )
+
+            variable_map = build_dimension_variables(
+                dimension_table
+            )
+
+            left_result = ensure_quantity(
+                eval_expr(
+                    left_expression,
+                    variable_map,
+                )
+            )
+
+            right_result = ensure_quantity(
+                eval_expr(
+                    right_expression,
+                    variable_map,
+                )
+            )
+
+            left_dimensions = format_dimensions(left_result)
+            right_dimensions = format_dimensions(right_result)
+
+            left_quantity_type = compatible_quantity_name(
+                left_result
+            )
+
+            right_quantity_type = compatible_quantity_name(
+                right_result
+            )
+
+            is_consistent = (
+                left_result.dimensionality
+                == right_result.dimensionality
+            )
+
+            if is_consistent:
+                output = (
+                    "✓ DIMENSIONALLY CONSISTENT\n\n"
+                    f"Left-hand side\n"
+                    f"{left_expression}\n"
+                    f"Dimensions: {left_dimensions}\n"
+                    f"Quantity type: {left_quantity_type}\n\n"
+                    f"Right-hand side\n"
+                    f"{right_expression}\n"
+                    f"Dimensions: {right_dimensions}\n"
+                    f"Quantity type: {right_quantity_type}\n\n"
+                    f"Both sides have the same physical dimensions."
+                )
+
+            else:
+                ratio = dimensional_ratio(
+                    left_result,
+                    right_result,
+                )
+
+                output = (
+                    "✗ DIMENSIONAL MISMATCH\n\n"
+                    f"Left-hand side\n"
+                    f"{left_expression}\n"
+                    f"Dimensions: {left_dimensions}\n"
+                    f"Quantity type: {left_quantity_type}\n\n"
+                    f"Right-hand side\n"
+                    f"{right_expression}\n"
+                    f"Dimensions: {right_dimensions}\n"
+                    f"Quantity type: {right_quantity_type}\n\n"
+                    f"Right / left dimensional ratio\n"
+                    f"{ratio}\n\n"
+                    f"A valid physical equation requires this ratio "
+                    f"to be dimensionless."
+                )
+
+            st.write("Result:")
+            st.code(output)
+
+        except Exception as error:
+            st.write("Result:")
+            st.code(f"ERROR\n\n{error}")
+
+    st.caption(
+        "Dimensional consistency is necessary, but it does not prove "
+        "that an equation is physically correct."
+    )
+
+
+# =========================================================
+# Main Streamlit application
+# =========================================================
+def main() -> None:
+    st.set_page_config(
+        page_title="UnitGuard",
+        layout="wide",
+    )
+
+    st.title("UnitGuard")
+
+    calculation_tab, dimensional_tab = st.tabs(
+        [
+            "Calculation Checker",
+            "Dimensional Checker",
+        ]
+    )
+
+    with calculation_tab:
+        render_calculation_checker()
+
+    with dimensional_tab:
+        render_dimensional_checker()
+
+
+
+
+
+def launch_streamlit() -> None:
+
     command = [
         sys.executable,
         "-m",
@@ -357,20 +853,22 @@ def _launch_streamlit() -> NoReturn:
     ]
 
     try:
-        completed = subprocess.run(command, check=False)
+        completed_process = subprocess.run(
+            command,
+            check=False,
+        )
     except KeyboardInterrupt:
         raise SystemExit(130) from None
 
-    raise SystemExit(completed.returncode)
+    raise SystemExit(completed_process.returncode)
 
 
-def _run_entrypoint() -> None:
-    """Render inside Streamlit, or bootstrap Streamlit for a direct run."""
+def run_entrypoint() -> None:
     if st_runtime.exists():
         main()
     else:
-        _launch_streamlit()
+        launch_streamlit()
 
 
 if __name__ == "__main__":
-    _run_entrypoint()
+    run_entrypoint()
