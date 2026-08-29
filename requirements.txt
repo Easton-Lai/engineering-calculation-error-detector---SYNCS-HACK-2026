@@ -1,0 +1,4 @@
+pandas==3.0.5
+pandas-stubs==3.0.5.260730
+streamlit==1.62.0
+pint==0.25.3
