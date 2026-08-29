@@ -191,7 +191,7 @@ KNOWN_DIMENSIONS: Final[dict[DimensionKey, str]] = {
     _dimension_key(
         mass=1,
         time=-1,
-    ): "Mass Flow Rate",
+    ): "Mass Flow Rate / Damping Coefficient",
 
     _dimension_key(
         mass=1,
@@ -202,7 +202,7 @@ KNOWN_DIMENSIONS: Final[dict[DimensionKey, str]] = {
     _dimension_key(
         length=2,
         time=-1,
-    ): "Kinematic Viscosity",
+    ): "Kinematic Viscosity / Thermal Diffusivity",
 
     _dimension_key(
         mass=1,
@@ -212,7 +212,7 @@ KNOWN_DIMENSIONS: Final[dict[DimensionKey, str]] = {
     _dimension_key(
         mass=1,
         time=-2,
-    ): "Surface Tension",
+    ): "Spring Stiffness / Surface Tension",
 
     _dimension_key(
         length=2,
@@ -223,7 +223,7 @@ KNOWN_DIMENSIONS: Final[dict[DimensionKey, str]] = {
         length=2,
         time=-2,
         temperature=-1,
-    ): "Specific Heat Capacity",
+    ): "Specific Heat Capacity / Specific Entropy",
 
     _dimension_key(
         mass=1,
@@ -1771,6 +1771,13 @@ def render_calculation_checker() -> None:
             key="calculation_expression",
         )
         or ""
+    )
+
+    st.caption(
+        "Supported syntax: +, -, *, /, ^, ** and brackets. "
+        "Use explicit multiplication, for example "
+        "0.5 * m * v^2. Enter only the expression, "
+        "not a complete equation."
     )
 
     default_table = pd.DataFrame(
