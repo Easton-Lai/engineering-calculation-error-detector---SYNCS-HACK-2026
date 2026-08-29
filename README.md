@@ -66,3 +66,7 @@ category is available.
 & '.\.venv\Scripts\python.exe' -m pip check
 & '.\.venv\Scripts\python.exe' -m unittest discover -s tests -v
 ```
+## Team Contributions
+
+- **Jialong Xu** – Overall project architecture and integration; developed the Calculation Checker.
+- **Jinhao Lai** – Developed the Dimensional Checker and Unit Converter; responsible for debugging and reliability improvements.
